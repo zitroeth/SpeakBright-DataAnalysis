@@ -40,11 +40,11 @@ def simple_exponential_smoothing(request: PredictionRequest):
 
         # Check for sufficient data points
         if len(values) < 2:
-            raise HTTPException(status_code=400, detail="At least two data points are required.")
+            return PredictionResponse(predictedSum=0)
 
         # Fit the simple exponential smoothing model
         model = SimpleExpSmoothing(np.array(values))
-        fit = model.fit(smoothing_level=0.4, optimized=True)  # Smoothing level prioritizes recent data
+        fit = model.fit(smoothing_level=0.6, optimized=True)  # Smoothing level prioritizes recent data
 
         print(f"start{request.start} end{request.end}")
         # Predict the future values
