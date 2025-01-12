@@ -36,7 +36,6 @@ def simple_exponential_smoothing(request: PredictionRequest):
     try:
         # Extract timeTakenIndependence values
         values = [item.timeTakenIndependence for item in request.data]
-        print(f"values: {values}")
 
         # Check for sufficient data points
         if len(values) < 2:
@@ -44,14 +43,14 @@ def simple_exponential_smoothing(request: PredictionRequest):
 
         # Fit the simple exponential smoothing model
         model = SimpleExpSmoothing(np.array(values))
-        fit = model.fit(smoothing_level=0.6, optimized=True)  # Smoothing level prioritizes recent data
-
-        print(f"start{request.start} end{request.end}")
+        
+        # Use least_squares approximation to get smoothing constant
+        fit = model.fit(smoothing_level=None, method='least_squares', optimized=True)  
+        
         # Predict the future values
         forecast = fit.predict(start=request.start, end=request.end - 1)
 
         # Sum the predicted values in the specified range
-        print(f"prediction forecast: {forecast}")
         predicted_sum = sum(forecast)
 
         return PredictionResponse(predictedSum=predicted_sum)
