@@ -3,3 +3,8 @@
 
 # Ignore Python cache files
 __pycache__/
+
+# Ignore environments
+.env
+*.env
+!*.env.example
