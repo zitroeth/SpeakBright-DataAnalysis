@@ -12,7 +12,8 @@ import json
 import firebase_admin
 from firebase_admin import credentials, firestore
 import datetime
-from dateutil import parser 
+from dateutil import parser
+import math
 
 # Load environment variables from .env file
 load_dotenv()
@@ -328,5 +329,115 @@ def addToMonitorList(receiver_email: str, requester_email: str, type: str):
         guardian_doc_ref = guardian_docs[0].reference
         # Add a new document to the "students" subcollection.
         guardian_doc_ref.collection("students").document(user_doc_id).set({**user_doc, "id": user_doc_id})
+
+# Models for EMA mobile endpoint
+class PhasePrediction(BaseModel):
+    phase: int
+    predictedSum: float
+
+def convert_milliseconds_to_readable_string(milliseconds: float, shorten: bool = False) -> str:
+    seconds = int((milliseconds / 1000) % 60)
+    minutes = int((milliseconds / (1000 * 60)) % 60)
+    hours   = int((milliseconds / (1000 * 60 * 60)) % 24)
+    days    = int((milliseconds / (1000 * 60 * 60 * 24)) % 30.44)
+    months  = int((milliseconds / (1000 * 60 * 60 * 24 * 30.44)) % 12)
+    years   = int(milliseconds / (1000 * 60 * 60 * 24 * 365.25))
+
+    parts: List[str] = []
+
+    def add(unit_val, name):
+        if unit_val:
+            parts.append(f"{unit_val} {name}" + ("s" if unit_val != 1 else ""))
+
+    if shorten:
+        # only top 3 non-zero units
+        units = [("year", years), ("month", months), ("day", days),
+                 ("hour", hours), ("minute", minutes), ("second", seconds)]
+        count = 0
+        for name, val in units:
+            if val and count < 3:
+                add(val, name)
+                count += 1
+    else:
+        add(years,   "year")
+        add(months,  "month")
+        add(days,    "day")
+        add(hours,   "hour")
+        add(minutes, "minute")
+        add(seconds, "second")
+        if not parts:
+            parts.append("0 seconds")
+
+    return ", ".join(parts)
+
+
+@app.get("/ema-mobile/{student_id}", response_model=List[PhasePrediction])
+def ema_mobile(student_id: str):
+    predictions: List[PhasePrediction] = []
+
+    for phase in range(1, 4):
+        # 1) build map of earliest “started at” per card from activity_log
+        started_at: dict = {}
+        phase_col = db.collection("activity_log").document(student_id)\
+                      .collection("phase").document(str(phase)).collection("session")
+        for sess in phase_col.stream():
+            sess_ts = sess.to_dict().get("timestamp")
+            if not sess_ts:
+                continue
+            for trial in sess.reference.collection("trialPrompt").stream():
+                d = trial.to_dict()
+                cid, ts = d.get("cardID"), d.get("timestamp")
+                if not cid or not ts:
+                    continue
+                prev = started_at.get(cid)
+                if not prev or ts < prev:
+                    started_at[cid] = ts
+
+        # 2) gather all cards for this phase and count total
+        phase_cards = []
+        for card in db.collection("cards").where("userId", "==", student_id).stream():
+            cd = card.to_dict()
+            cat = cd.get("category", "")
+            if phase == 1 \
+               or (phase == 2 and cat != "Emotions") \
+               or (phase == 3 and cat == "Emotions"):
+                phase_cards.append(card)
+        total_cards = len(phase_cards)
+
+        # 3) compute durations only for those that have completed
+        completion_list = []
+        for card in phase_cards:
+            cd = card.to_dict()
+            comp_ts = cd.get(f"phase{phase}_completion")
+            if not comp_ts:
+                continue
+            start_ts = started_at.get(card.id)
+            if not start_ts:
+                continue
+            dur = (comp_ts - start_ts).total_seconds() * 1000
+            completion_list.append((comp_ts, dur))
+
+        # 4) sort & extract durations
+        completion_list.sort(key=lambda x: x[0])
+        durations = [dur for _, dur in completion_list]
+        if not durations:
+            continue
+
+        # 5) forecast from next index (len(durations)) up to total_cards
+        req = PredictionRequest(
+            data=[DataPoint(timeTakenIndependence=d) for d in durations],
+            start=len(durations),
+            end=total_cards
+        )
+        resp = simple_exponential_smoothing(req)
+        predictions.append(PhasePrediction(phase=phase, predictedSum=resp.predictedSum))
+
+    # print formatted strings before returning
+    for p in predictions:
+        readable = convert_milliseconds_to_readable_string(p.predictedSum, shorten=True)
+        print(f"Phase {p.phase} prediction: {readable}")
+
+    return predictions
+
 # Run with `uvicorn filename:app --reload` (adjust filename accordingly)
 # fastapi dev main.py --port 5174
