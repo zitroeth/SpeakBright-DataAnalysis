@@ -283,10 +283,11 @@ def verify_invite(
     
     # Query Firestore for a matching invitation document.
     codes_ref = db.collection("codes")
-    query = codes_ref.where("receiver_email", "==", receiver_email)\
-                     .where("requester_email", "==", requester_email)\
-                     .where("code", "==", code)\
-                     .limit(1).stream()
+    query = codes_ref \
+            .where(field_path="receiver_email", op_string="==", value=receiver_email) \
+            .where(field_path="requester_email", op_string="==", value=requester_email) \
+            .where(field_path="code", op_string="==", value=code) \
+            .limit(1).stream()
     
     doc_found = None
     for doc in query:
@@ -303,7 +304,9 @@ def verify_invite(
 
 def addToMonitorList(receiver_email: str, requester_email: str, type: str):
     # Fetch the user document from "users" collection where field email equals receiver_email.
-    user_docs = list(db.collection("users").where("email", "==", receiver_email).limit(1).stream())
+    user_docs = list(db.collection("users") \
+                     .where(field_path="email", op_string="==", value=receiver_email) \
+                     .limit(1).stream())
     if not user_docs:
         # Optionally, handle case when no user document is found.
         return
@@ -313,7 +316,9 @@ def addToMonitorList(receiver_email: str, requester_email: str, type: str):
 
     if type == "guardian-monitoring-request":
         # For guardian monitor request, fetch the parent document in the "user_admin" collection where email equals requester_email.
-        admin_docs = list(db.collection("user_admin").where("email", "==", requester_email).limit(1).stream())
+        admin_docs = list(db.collection("user_admin") \
+                          .where(field_path="email", op_string="==", value=requester_email) \
+                          .limit(1).stream())
         if not admin_docs:
             # Optionally, create a new parent document if one doesn't exist.
             # Here we assume a document should already exist. Adjust as needed.
@@ -323,7 +328,9 @@ def addToMonitorList(receiver_email: str, requester_email: str, type: str):
         admin_doc_ref.collection("guardians").document(user_doc_id).set({**user_doc, "id": user_doc_id})
     elif type == "student-monitoring-request":
         # For student monitor request, fetch the parent document in the "user_guardian" collection where email equals requester_email.
-        guardian_docs = list(db.collection("user_guardian").where("email", "==", requester_email).limit(1).stream())
+        guardian_docs = list(db.collection("user_guardian") \
+                             .where(field_path="email", op_string="==", value=requester_email) \
+                             .limit(1).stream())
         if not guardian_docs:
             raise Exception("Parent document for requester not found in user_guardian collection.")
         guardian_doc_ref = guardian_docs[0].reference
@@ -333,7 +340,8 @@ def addToMonitorList(receiver_email: str, requester_email: str, type: str):
 # Models for EMA mobile endpoint
 class PhasePrediction(BaseModel):
     phase: int
-    predictedSum: float
+    predictedMili: float
+    predictedString: str
 
 def convert_milliseconds_to_readable_string(milliseconds: float, shorten: bool = False) -> str:
     seconds = int((milliseconds / 1000) % 60)
@@ -395,7 +403,9 @@ def ema_mobile(student_id: str):
 
         # 2) gather all cards for this phase and count total
         phase_cards = []
-        for card in db.collection("cards").where("userId", "==", student_id).stream():
+        for card in db.collection("cards") \
+                      .where(field_path="userId", op_string="==", value=student_id) \
+                      .stream():
             cd = card.to_dict()
             cat = cd.get("category", "")
             if phase == 1 \
@@ -404,10 +414,13 @@ def ema_mobile(student_id: str):
                 phase_cards.append(card)
         total_cards = len(phase_cards)
 
-        # 3) compute durations only for those that have completed
+        # 3) compute durations only for those that are independent and have completed
         completion_list = []
         for card in phase_cards:
             cd = card.to_dict()
+            # only include cards marked independent for this phase
+            if not cd.get(f"phase{phase}_independence", False):
+                continue
             comp_ts = cd.get(f"phase{phase}_completion")
             if not comp_ts:
                 continue
@@ -430,14 +443,32 @@ def ema_mobile(student_id: str):
             end=total_cards
         )
         resp = simple_exponential_smoothing(req)
-        predictions.append(PhasePrediction(phase=phase, predictedSum=resp.predictedSum))
+        predictions.append(
+            PhasePrediction(
+                phase=phase,
+                predictedMili=resp.predictedSum,
+                predictedString=convert_milliseconds_to_readable_string(
+                    resp.predictedSum, shorten=True
+                )
+            )
+        )
 
     # print formatted strings before returning
     for p in predictions:
-        readable = convert_milliseconds_to_readable_string(p.predictedSum, shorten=True)
-        print(f"Phase {p.phase} prediction: {readable}")
+        print(f"Phase {p.phase} prediction: {p.predictedString}")
 
     return predictions
 
 # Run with `uvicorn filename:app --reload` (adjust filename accordingly)
 # fastapi dev main.py --port 5174
+
+if __name__ == "__main__":
+    import uvicorn
+    # read PORT from environment (default to 4000)
+    port = int(os.getenv("PORT", 4000))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=True,
+    )
