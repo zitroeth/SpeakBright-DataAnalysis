@@ -53,8 +53,10 @@ class PredictionRequest(BaseModel):
     start: int  # Start index for prediction
     end: int    # End index for prediction
 
+# Extend PredictionResponse to carry smoothing level
 class PredictionResponse(BaseModel):
     predictedSum: float
+    smoothingLevel: float
 
 @app.post("/simple-exponential-smoothing/", response_model=PredictionResponse)
 def simple_exponential_smoothing(request: PredictionRequest):
@@ -64,93 +66,29 @@ def simple_exponential_smoothing(request: PredictionRequest):
 
         # Check for sufficient data points
         if len(values) < 2:
-            return PredictionResponse(predictedSum=0)
+            return PredictionResponse(predictedSum=0, smoothingLevel=0)
 
         # Fit the simple exponential smoothing model
         model = SimpleExpSmoothing(np.array(values))
         
         # Use least_squares approximation to get smoothing constant
         fit = model.fit(smoothing_level=None, method='least_squares', optimized=True)  
-        print(f"Fitted smoothing level: {fit.params['smoothing_level']}\nCount: {len(values)}")
+        smoothing_level = fit.params["smoothing_level"]
+        print(f"Fitted smoothing level: {smoothing_level}\nCount: {len(values)}")
+        
         # Predict the future values
         forecast = fit.predict(start=request.start, end=request.end - 1)
 
         # Sum the predicted values in the specified range
         predicted_sum = sum(forecast)
 
-        return PredictionResponse(predictedSum=predicted_sum)
+        return PredictionResponse(
+            predictedSum=predicted_sum,
+            smoothingLevel=smoothing_level
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# class EmailTemplate(BaseModel):
-#     from_email: str
-#     to_email: str
-#     template_alias: str
-#     template_model: dict
-
-# @app.post("/send-email-with-template/")
-# def send_email_with_template(email_template: EmailTemplate):
-#     headers = {
-#         "Accept": "application/json",
-#         "Content-Type": "application/json",
-#         "X-Postmark-Server-Token": os.getenv("POSTMARK_API_TOKEN"),
-#     }
-#     data = {
-#         "From": email_template.from_email,
-#         "To": email_template.to_email,
-#         "TemplateAlias": email_template.template_alias,
-#         "TemplateModel": email_template.template_model
-#     }
-#     try:
-#         response = requests.post(os.getenv("POSTMARK_URL"), headers=headers, json=data)
-#         response.raise_for_status()
-#     except requests.exceptions.HTTPError as http_err:
-#         raise HTTPException(status_code=response.status_code, detail=str(http_err))
-#     except Exception as err:
-#         raise HTTPException(status_code=500, detail=str(err))
-    
-#     return response.json()
-
-# class EncodeRequest(BaseModel):
-#     email: str
-#     type: str
-
-# class EncodeResponse(BaseModel):
-#     encoded: str
-    
-# @app.post("/encode", response_model=EncodeResponse)
-# def encode_json(request: EncodeRequest):
-#     try:
-#         # Convert JSON object to string
-#         json_str = json.dumps(request.data)
-#         # Encrypt the string (must encode to bytes)
-#         encrypted_bytes = f.encrypt(json_str.encode())
-#         # Return the encrypted string (decoded for JSON compatibility)
-#         return {"encoded": encrypted_bytes.decode("utf-8")}
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail="Encoding failed")
-
-# # Models for decode endpoint
-# class DecodeRequest(BaseModel):
-#     encoded: str
-
-# class DecodeResponse(BaseModel):
-#     data: dict
-
-# @app.post("/decode", response_model=DecodeResponse)
-# def decode_json(request: DecodeRequest):
-#     try:
-#         # Decrypt the encoded string (after encoding it back to bytes)
-#         decrypted_bytes = f.decrypt(request.encoded.encode("utf-8"))
-#         # Convert decrypted bytes back to a string
-#         json_str = decrypted_bytes.decode("utf-8")
-#         # Convert JSON string to JSON object
-#         data = json.loads(json_str)
-#         return {"data": data}
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail="Decoding failed")
-
-# Email templating model and send function.
 # Email templating model and send function.
 class EmailTemplate(BaseModel):
     from_email: str
@@ -418,25 +356,25 @@ def ema_mobile(student_id: str):
         completion_list = []
         for card in phase_cards:
             cd = card.to_dict()
-            # only include cards marked independent for this phase
             if not cd.get(f"phase{phase}_independence", False):
                 continue
-            comp_ts = cd.get(f"phase{phase}_completion")
+            comp_ts = cd.get(f"phase{phase}_completion", False)
             if not comp_ts:
                 continue
             start_ts = started_at.get(card.id)
             if not start_ts:
                 continue
             dur = (comp_ts - start_ts).total_seconds() * 1000
-            completion_list.append((comp_ts, dur))
+            title = cd.get("title", "")
+            completion_list.append((comp_ts, dur, card.id, title, start_ts))
 
         # 4) sort & extract durations
         completion_list.sort(key=lambda x: x[0])
-        durations = [dur for _, dur in completion_list]
+        durations = [dur for _, dur, _, _, _ in completion_list]
         if not durations:
             continue
 
-        # 5) forecast from next index (len(durations)) up to total_cards
+        # 5) forecast from next index up to total_cards
         req = PredictionRequest(
             data=[DataPoint(timeTakenIndependence=d) for d in durations],
             start=len(durations),
@@ -458,6 +396,124 @@ def ema_mobile(student_id: str):
         print(f"Phase {p.phase} prediction: {p.predictedString}")
 
     return predictions
+
+# Models for raw output
+class CardDetail(BaseModel):
+    cardId: str
+    title: str
+    startedAt: str
+    completedAt: str
+    durationTookForIndependence: float
+    durationTookForIndependenceString: str  # new field
+
+class PhaseDetail(BaseModel):
+    phase: int
+    phasePrediction: float
+    smoothingLevel: float
+    phasePredictionString: str
+    nonIndependentCount: int             # new field
+    cards: List[CardDetail]
+
+@app.get("/ema-mobile-raw/{student_id}", response_model=List[PhaseDetail])
+def ema_mobile_raw(student_id: str):
+    raw_output: List[PhaseDetail] = []
+
+    for phase in range(1, 4):
+        # 1) build started_at map (same as ema_mobile)
+        started_at: dict = {}
+        phase_col = db.collection("activity_log")\
+                      .document(student_id)\
+                      .collection("phase")\
+                      .document(str(phase))\
+                      .collection("session")
+        for sess in phase_col.stream():
+            sess_ts = sess.to_dict().get("timestamp")
+            if not sess_ts:
+                continue
+            for trial in sess.reference.collection("trialPrompt").stream():
+                d = trial.to_dict()
+                cid, ts = d.get("cardID"), d.get("timestamp")
+                if not cid or not ts:
+                    continue
+                prev = started_at.get(cid)
+                if not prev or ts < prev:
+                    started_at[cid] = ts
+
+        # 2) gather and filter cards
+        phase_cards = []
+        for card in db.collection("cards")\
+                      .where(field_path="userId", op_string="==", value=student_id)\
+                      .stream():
+            cd = card.to_dict()
+            cat = cd.get("category", "")
+            if phase == 1 \
+               or (phase == 2 and cat != "Emotions") \
+               or (phase == 3 and cat == "Emotions"):
+                phase_cards.append(card)
+        total_cards = len(phase_cards)
+
+        # 3) compute durations for independent cards
+        completion_list = []
+        for card in phase_cards:
+            cd = card.to_dict()
+            if not cd.get(f"phase{phase}_independence", False):
+                continue
+            comp_ts = cd.get(f"phase{phase}_completion")
+            if not comp_ts:
+                continue
+            start_ts = started_at.get(card.id)
+            if not start_ts:
+                continue
+            dur = (comp_ts - start_ts).total_seconds() * 1000
+            title = cd.get("title", "")
+            completion_list.append((comp_ts, dur, card.id, title, start_ts))
+
+        if not completion_list:
+            continue
+
+        # 4) sort & forecast
+        completion_list.sort(key=lambda x: x[0])
+        durations = [dur for _, dur, _, _, _ in completion_list]
+
+        req = PredictionRequest(
+            data=[DataPoint(timeTakenIndependence=d) for d in durations],
+            start=len(durations),
+            end=total_cards
+        )
+        resp = simple_exponential_smoothing(req)
+
+        # 5) build card details including the string versions
+        cards = [
+            CardDetail(
+                cardId=cid,
+                title=title,
+                startedAt=start_ts.isoformat(),
+                completedAt=comp_ts.isoformat(),
+                durationTookForIndependence=dur,
+                durationTookForIndependenceString=convert_milliseconds_to_readable_string(
+                    dur, shorten=True
+                )
+            )
+            for comp_ts, dur, cid, title, start_ts in completion_list
+        ]
+
+        non_independent = total_cards - len(completion_list)
+
+        phase_output = PhaseDetail(
+            phase=phase,
+            phasePrediction=resp.predictedSum,
+            smoothingLevel=resp.smoothingLevel,
+            phasePredictionString=convert_milliseconds_to_readable_string(
+                resp.predictedSum, shorten=True
+            ),
+            nonIndependentCount=non_independent,
+            cards=cards
+        )
+
+        print(phase_output.dict())
+        raw_output.append(phase_output)
+
+    return raw_output
 
 # Run with `uvicorn filename:app --reload` (adjust filename accordingly)
 # fastapi dev main.py --port 5174
